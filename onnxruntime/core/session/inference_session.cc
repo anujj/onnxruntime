@@ -38,6 +38,7 @@
 #include "core/framework/plugin_ep_stream.h"
 #include "core/framework/transform_layout_functions.h"
 #include "core/framework/utils.h"
+#include "core/graph/constants.h"
 #include "core/graph/graph_viewer.h"
 #include "core/graph/model.h"
 #include "core/graph/model_editor_api_types.h"
@@ -3937,6 +3938,8 @@ common::Status InferenceSession::AddPredefinedTransformers(
     RecordRuntimeOptimizationProducedNodeOpSchemaFn record_runtime_optimization_produced_op_schema_fn,
     const logging::Logger& logger) const {
   const auto& cpu_ep = *execution_providers_.Get(onnxruntime::kCpuExecutionProvider);
+  const bool enable_webnn_dq_matmulnbits_fusion =
+      execution_providers_.Get(onnxruntime::kNvTensorRTRTXExecutionProvider) != nullptr;
   for (int i = static_cast<int>(TransformerLevel::Default); i <= static_cast<int>(TransformerLevel::MaxLevel); i++) {
     TransformerLevel level = static_cast<TransformerLevel>(i);
     std::function<onnxruntime::InlinedVector<std::unique_ptr<GraphTransformer>>()> transformers_to_register;
@@ -3948,7 +3951,8 @@ common::Status InferenceSession::AddPredefinedTransformers(
         transformers_to_register = [&]() {
           return optimizer_utils::GenerateTransformers(level, session_options_, cpu_ep, logger,
                                                        optimizers_to_disable_,
-                                                       GetIntraOpThreadPoolToUse());
+                                                       GetIntraOpThreadPoolToUse(),
+                                                       enable_webnn_dq_matmulnbits_fusion);
         };
       }
     } else {
@@ -3962,7 +3966,8 @@ common::Status InferenceSession::AddPredefinedTransformers(
           if (use_full_build_optimizations) {
             return optimizer_utils::GenerateTransformers(level, session_options_, cpu_ep, logger,
                                                          optimizers_to_disable_,
-                                                         GetIntraOpThreadPoolToUse());
+                                                         GetIntraOpThreadPoolToUse(),
+                                                         enable_webnn_dq_matmulnbits_fusion);
           } else {
             const auto sat_context =
                 minimal_build_optimization_handling ==
