@@ -250,9 +250,11 @@ Status WebNNDQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int gra
       }
     }
 
-    // Validate Gemm attributes and bias shape (if present).
-    // We only support Gemm forms equivalent to MatMul (+ optional 1D bias):
+    // Validate Gemm attributes.
+    // We only support Gemm forms equivalent to MatMul:
     //   alpha=1, beta=1, transA=0, transB=0.
+    // If Gemm has bias input C, skip this fusion in phase 1 to avoid
+    // silently changing numerics.
     if (node->OpType() == "Gemm") {
       if (const auto* alpha_attr = graph_utils::GetNodeAttribute(*node, "alpha");
           alpha_attr && std::abs(alpha_attr->f() - 1.0f) > 1e-6f) {
@@ -274,16 +276,8 @@ Status WebNNDQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int gra
         continue;
       }
 
-      // If Gemm has bias input C, it must be a 1D bias of shape [N].
       if (mm_inputs.size() > 2 && mm_inputs[2] && mm_inputs[2]->Exists()) {
-        const auto* bias_shape = mm_inputs[2]->Shape();
-        if (!bias_shape || bias_shape->dim_size() != 1 ||
-            !utils::HasDimValue(bias_shape->dim(0))) {
-          continue;
-        }
-        if (bias_shape->dim(0).dim_value() != N) {
-          continue;
-        }
+        continue;
       }
     }
 
@@ -449,22 +443,6 @@ Status WebNNDQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int gra
       mnb_inputs.push_back(&graph_utils::AddInitializerWithOrtValue(graph, zp_mnb_tp.value(), std::move(*zp_dst)));
     }
 
-    // Preserve Gemm bias (if any) by wiring it to MatMulNBits input[5].
-    // MatMulNBits input layout:
-    //   0:A, 1:B, 2:scales, 3:zero_points(opt), 4:g_idx(opt), 5:bias(opt)
-    bool fused_with_bias = false;
-    if (mm_node->OpType() == "Gemm" &&
-        mm_node->InputDefs().size() > 2 &&
-        mm_node->InputDefs()[2] &&
-        mm_node->InputDefs()[2]->Exists()) {
-      NodeArg& empty_arg = graph.GetOrCreateNodeArg("", nullptr);
-      while (mnb_inputs.size() < 5) {
-        mnb_inputs.push_back(&empty_arg);
-      }
-      mnb_inputs.push_back(const_cast<NodeArg*>(mm_node->InputDefs()[2]));
-      fused_with_bias = true;
-    }
-
     // Build outputs: same as MatMul output
     std::vector<NodeArg*> mnb_outputs;
     mnb_outputs.push_back(const_cast<NodeArg*>(mm_node->OutputDefs()[0]));
@@ -499,7 +477,6 @@ Status WebNNDQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int gra
     LOGS(logger, INFO) << "WebNNDQMatMulNBitsFusion: fused DQ+Reshape+Transpose"
                        << (match.cast_idx ? "+Cast" : "")
                        << "+MatMul/Gemm -> MatMulNBits"
-                       << (fused_with_bias ? " (bias preserved)" : "")
                        << (elide_default_uint4_zp8_input ? " (default UINT4 zp8 elided)" : "");
     modified = true;
   }
