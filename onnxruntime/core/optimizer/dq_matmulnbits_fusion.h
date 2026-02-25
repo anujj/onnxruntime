@@ -21,9 +21,9 @@ class ThreadPool;
 //   1) ORT-Web WebNN EP (lowers MatMulNBits to DQ+Reshape+Transpose+MatMul primitives)
 //   2) Chromium WebNN backend (converts WebNN ops back to ONNX)
 //   3) ORT native graph optimizations (may produce Gemm from MatMul+Add)
-class WebNNDQMatMulNBitsFusion : public GraphTransformer {
+class DQMatMulNBitsFusion : public GraphTransformer {
  public:
-  explicit WebNNDQMatMulNBitsFusion(
+  explicit DQMatMulNBitsFusion(
       int64_t accuracy_level = 4,
       concurrency::ThreadPool* intra_op_thread_pool = nullptr,
       const InlinedHashSet<std::string_view>& compatible_eps = {});

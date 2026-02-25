@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include "core/optimizer/webnn_dq_matmulnbits_fusion.h"
+#include "core/optimizer/dq_matmulnbits_fusion.h"
 
 #include "core/common/common.h"
 #include "core/framework/tensorprotoutils.h"
@@ -123,19 +123,19 @@ void TransposePackZPAxis0(
 
 }  // namespace
 
-WebNNDQMatMulNBitsFusion::WebNNDQMatMulNBitsFusion(
+DQMatMulNBitsFusion::DQMatMulNBitsFusion(
     int64_t accuracy_level,
     concurrency::ThreadPool* intra_op_thread_pool,
     const InlinedHashSet<std::string_view>& compatible_eps)
-    : GraphTransformer("WebNNDQMatMulNBitsFusion", compatible_eps),
+    : GraphTransformer("DQMatMulNBitsFusion", compatible_eps),
       accuracy_level_(accuracy_level),
       intra_op_thread_pool_(intra_op_thread_pool) {
   ORT_ENFORCE(accuracy_level_ >= 0 && accuracy_level_ <= 4,
               "MatMulNBits accuracy level must be between 0 and 4");
 }
 
-Status WebNNDQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_level,
-                                           const logging::Logger& logger) const {
+Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_level,
+                                      const logging::Logger& logger) const {
   GraphViewer graph_viewer(graph);
   const auto& node_topology_list = graph_viewer.GetNodesInTopologicalOrder();
 
@@ -359,7 +359,7 @@ Status WebNNDQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int gra
       if (!zp_const_tp || zp_const_tp->data_type() != ONNX_NAMESPACE::TensorProto_DataType_UINT4) continue;
     }
 
-    LOGS(logger, INFO) << "WebNNDQMatMulNBitsFusion: matched pattern at MatMul node '"
+    LOGS(logger, INFO) << "DQMatMulNBitsFusion: matched pattern at MatMul node '"
                        << node->Name() << "'";
 
     matches.push_back({node->Index(),
@@ -460,7 +460,7 @@ Status WebNNDQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int gra
       }
     }
 
-    LOGS(logger, INFO) << "WebNNDQMatMulNBitsFusion: matched direct DQ->MatMul pattern at node '"
+    LOGS(logger, INFO) << "DQMatMulNBitsFusion: matched direct DQ->MatMul pattern at node '"
                        << node->Name() << "' (K=" << K << ", N=" << N << ", block_size=" << block_size << ")";
     direct_matches.push_back({node->Index(), dq_node->Index()});
   }
@@ -646,7 +646,7 @@ Status WebNNDQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int gra
     graph_utils::RemoveNodeOutputEdges(graph, *graph.GetNode(match.dq_idx));
     graph.RemoveNode(match.dq_idx);
 
-    LOGS(logger, INFO) << "WebNNDQMatMulNBitsFusion: fused DQ+Reshape+Transpose"
+    LOGS(logger, INFO) << "DQMatMulNBitsFusion: fused DQ+Reshape+Transpose"
                        << (match.cast_idx ? "+Cast" : "")
                        << "+MatMul/Gemm -> MatMulNBits"
                        << (fused_with_bias ? " (bias preserved)" : "")
@@ -803,7 +803,7 @@ Status WebNNDQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int gra
     graph_utils::RemoveNodeOutputEdges(graph, *graph.GetNode(match.dq_idx));
     graph.RemoveNode(match.dq_idx);
 
-    LOGS(logger, INFO) << "WebNNDQMatMulNBitsFusion: fused direct DQ(axis=0)+MatMul/Gemm -> MatMulNBits"
+    LOGS(logger, INFO) << "DQMatMulNBitsFusion: fused direct DQ(axis=0)+MatMul/Gemm -> MatMulNBits"
                        << " (K=" << K << ", N=" << N << ", block_size=" << block_size << ")"
                        << (fused_with_bias ? " (bias preserved)" : "")
                        << (elide_zp ? " (default UINT4 zp8 elided)" : "");

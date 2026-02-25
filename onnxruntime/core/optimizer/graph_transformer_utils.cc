@@ -13,7 +13,7 @@
 #include "core/optimizer/qdq_transformer/qdq_final_cleanup.h"
 #include "core/optimizer/qdq_transformer/selectors_actions/qdq_selector_action_transformer.h"
 #include "core/optimizer/selectors_actions/selector_action_transformer_apply_contexts.h"
-#include "core/optimizer/webnn_dq_matmulnbits_fusion.h"
+#include "core/optimizer/dq_matmulnbits_fusion.h"
 #include "core/session/onnxruntime_session_options_config_keys.h"
 #include "core/platform/threadpool.h"
 
@@ -206,7 +206,7 @@ InlinedVector<std::unique_ptr<GraphTransformer>> GenerateTransformers(
     const logging::Logger& logger,
     const InlinedHashSet<std::string>& rules_and_transformers_to_disable,
     [[maybe_unused]] concurrency::ThreadPool* intra_op_thread_pool,
-    bool enable_webnn_dq_matmulnbits_fusion) {
+    bool enable_dq_matmulnbits_fusion) {
   InlinedVector<std::unique_ptr<GraphTransformer>> transformers;
   const bool disable_quant_qdq =
       session_options.config_options.GetConfigOrDefault(kOrtSessionOptionsDisableQuantQDQ, "0") == "1";
@@ -277,12 +277,12 @@ InlinedVector<std::unique_ptr<GraphTransformer>> GenerateTransformers(
       }
 
 #if !defined(DISABLE_CONTRIB_OPS)
-      if (enable_webnn_dq_matmulnbits_fusion && !disable_quant_qdq) {
+      if (enable_dq_matmulnbits_fusion && !disable_quant_qdq) {
         const int64_t qdq_matmulnbits_accuracy_level =
             ParseStringWithClassicLocale<int64_t>(
                 session_options.config_options.GetConfigOrDefault(kOrtSessionOptionsQDQMatMulNBitsAccuracyLevel,
                                                                   "4"));
-        transformers.emplace_back(std::make_unique<WebNNDQMatMulNBitsFusion>(
+        transformers.emplace_back(std::make_unique<DQMatMulNBitsFusion>(
             qdq_matmulnbits_accuracy_level, intra_op_thread_pool));
       }
 #endif

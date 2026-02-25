@@ -3938,7 +3938,7 @@ common::Status InferenceSession::AddPredefinedTransformers(
     RecordRuntimeOptimizationProducedNodeOpSchemaFn record_runtime_optimization_produced_op_schema_fn,
     const logging::Logger& logger) const {
   const auto& cpu_ep = *execution_providers_.Get(onnxruntime::kCpuExecutionProvider);
-  const bool enable_webnn_dq_matmulnbits_fusion =
+  const bool enable_dq_matmulnbits_fusion =
       execution_providers_.Get(onnxruntime::kNvTensorRTRTXExecutionProvider) != nullptr;
   for (int i = static_cast<int>(TransformerLevel::Default); i <= static_cast<int>(TransformerLevel::MaxLevel); i++) {
     TransformerLevel level = static_cast<TransformerLevel>(i);
@@ -3952,7 +3952,7 @@ common::Status InferenceSession::AddPredefinedTransformers(
           return optimizer_utils::GenerateTransformers(level, session_options_, cpu_ep, logger,
                                                        optimizers_to_disable_,
                                                        GetIntraOpThreadPoolToUse(),
-                                                       enable_webnn_dq_matmulnbits_fusion);
+                                                       enable_dq_matmulnbits_fusion);
         };
       }
     } else {
@@ -3967,7 +3967,7 @@ common::Status InferenceSession::AddPredefinedTransformers(
             return optimizer_utils::GenerateTransformers(level, session_options_, cpu_ep, logger,
                                                          optimizers_to_disable_,
                                                          GetIntraOpThreadPoolToUse(),
-                                                         enable_webnn_dq_matmulnbits_fusion);
+                                                         enable_dq_matmulnbits_fusion);
           } else {
             const auto sat_context =
                 minimal_build_optimization_handling ==
