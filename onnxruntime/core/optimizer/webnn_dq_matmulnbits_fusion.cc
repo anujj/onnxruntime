@@ -43,6 +43,10 @@ bool IsUniformPackedUint4Value(const Initializer& init, uint8_t expected_nibble)
   return true;
 }
 
+bool HasRank2Shape(const ONNX_NAMESPACE::TensorProto& tp, int64_t dim0, int64_t dim1) {
+  return tp.dims_size() == 2 && tp.dims(0) == dim0 && tp.dims(1) == dim1;
+}
+
 uint8_t GetPackedUint4Element(const uint8_t* packed, size_t index) {
   const uint8_t packed_byte = packed[index / 2];
   return (index % 2 == 0) ? static_cast<uint8_t>(packed_byte & 0x0F)
@@ -415,6 +419,7 @@ Status WebNNDQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int gra
     const int64_t K = weight_const_tp->dims(0);
     const int64_t N = weight_const_tp->dims(1);
     if (K <= 0 || N <= 0 || K % block_size != 0) continue;
+    const int64_t k_blocks = K / block_size;
 
     const auto* scale_arg = dq_node->InputDefs()[1];
     if (!scale_arg || !scale_arg->Exists()) continue;
@@ -423,6 +428,7 @@ Status WebNNDQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int gra
     int32_t dt_scale = scale_const_tp->data_type();
     if (dt_scale != ONNX_NAMESPACE::TensorProto_DataType_FLOAT &&
         dt_scale != ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) continue;
+    if (!HasRank2Shape(*scale_const_tp, k_blocks, N)) continue;
 
     const auto* a_arg = mm_inputs[0];
     if (!a_arg || !a_arg->TypeAsProto()) continue;
@@ -434,6 +440,7 @@ Status WebNNDQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int gra
     if (has_zp) {
       const auto* zp_const_tp = graph.GetConstantInitializer(zp_arg->Name(), true);
       if (!zp_const_tp || zp_const_tp->data_type() != ONNX_NAMESPACE::TensorProto_DataType_UINT4) continue;
+      if (!HasRank2Shape(*zp_const_tp, k_blocks, N)) continue;
     }
 
     if (node->OpType() == "Gemm") {
@@ -675,10 +682,15 @@ Status WebNNDQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int gra
 
     const int64_t K = weight_tp->dims(0);
     const int64_t N = weight_tp->dims(1);
+    if (K <= 0 || N <= 0 || block_size <= 0 || K % block_size != 0) continue;
     const int64_t k_blocks = K / block_size;
     const int64_t blob_bytes = block_size / 2;
+    if (!HasRank2Shape(*scale_tp, k_blocks, N)) continue;
+    if (zp_tp && !HasRank2Shape(*zp_tp, k_blocks, N)) continue;
 
     Initializer weight_src(graph, *weight_tp, graph.ModelPath());
+    const size_t required_weight_bytes = static_cast<size_t>(N * k_blocks * blob_bytes);
+    if (weight_src.DataAsByteSpan().size() < required_weight_bytes) continue;
     Initializer scale_src(graph, *scale_tp, graph.ModelPath());
     if (scale_src.data_type() != ONNX_NAMESPACE::TensorProto_DataType_FLOAT &&
         scale_src.data_type() != ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) continue;
@@ -723,6 +735,7 @@ Status WebNNDQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int gra
     if (zp_tp) {
       Initializer zp_src(graph, *zp_tp, graph.ModelPath());
       if (zp_src.data_type() != ONNX_NAMESPACE::TensorProto_DataType_UINT4) continue;
+      if (zp_src.size() != static_cast<size_t>(k_blocks * N)) continue;
 
       if (IsUniformPackedUint4Value(zp_src, 8)) {
         elide_zp = true;
