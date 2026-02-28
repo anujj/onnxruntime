@@ -20,6 +20,10 @@ namespace onnxruntime {
 
 namespace {
 
+// ---------------------------------------------------------------------------
+// Utility helpers
+// ---------------------------------------------------------------------------
+
 bool IsUniformPackedUint4Value(const Initializer& init, uint8_t expected_nibble) {
   if (init.data_type() != ONNX_NAMESPACE::TensorProto_DataType_UINT4) {
     return false;
@@ -121,46 +125,68 @@ void TransposePackZPAxis0(
   }
 }
 
-}  // namespace
+// ---------------------------------------------------------------------------
+// Match structs
+// ---------------------------------------------------------------------------
 
-DQMatMulNBitsFusion::DQMatMulNBitsFusion(
-    int64_t accuracy_level,
-    concurrency::ThreadPool* intra_op_thread_pool,
-    const InlinedHashSet<std::string_view>& compatible_eps)
-    : GraphTransformer("DQMatMulNBitsFusion", compatible_eps),
-      accuracy_level_(accuracy_level),
-      intra_op_thread_pool_(intra_op_thread_pool) {
-  ORT_ENFORCE(accuracy_level_ >= 0 && accuracy_level_ <= 4,
-              "MatMulNBits accuracy level must be between 0 and 4");
+struct FusionMatch {
+  NodeIndex matmul_idx;
+  std::optional<NodeIndex> cast_idx;
+  NodeIndex transpose_idx;
+  NodeIndex reshape_idx;
+  NodeIndex dq_idx;
+};
+
+struct DirectDQMatch {
+  NodeIndex matmul_idx;
+  NodeIndex dq_idx;
+};
+
+// ---------------------------------------------------------------------------
+// Shared Gemm validation (alpha=1, beta=1, transA=0, transB=0, bias 1-D [N])
+// ---------------------------------------------------------------------------
+
+bool ValidateGemmForFusion(const Node& gemm_node, int64_t N) {
+  if (const auto* alpha_attr = graph_utils::GetNodeAttribute(gemm_node, "alpha");
+      alpha_attr && std::abs(alpha_attr->f() - 1.0f) > 1e-6f)
+    return false;
+  if (const auto* beta_attr = graph_utils::GetNodeAttribute(gemm_node, "beta");
+      beta_attr && std::abs(beta_attr->f() - 1.0f) > 1e-6f)
+    return false;
+  if (const auto* trans_a = graph_utils::GetNodeAttribute(gemm_node, "transA");
+      trans_a && trans_a->i() != 0)
+    return false;
+  if (const auto* trans_b = graph_utils::GetNodeAttribute(gemm_node, "transB");
+      trans_b && trans_b->i() != 0)
+    return false;
+
+  const auto& inputs = gemm_node.InputDefs();
+  if (inputs.size() > 2 && inputs[2] && inputs[2]->Exists()) {
+    const auto* bias_shape = inputs[2]->Shape();
+    if (!bias_shape || bias_shape->dim_size() != 1 ||
+        !utils::HasDimValue(bias_shape->dim(0)) ||
+        bias_shape->dim(0).dim_value() != N)
+      return false;
+  }
+  return true;
 }
 
-Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_level,
-                                      const logging::Logger& logger) const {
-  GraphViewer graph_viewer(graph);
-  const auto& node_topology_list = graph_viewer.GetNodesInTopologicalOrder();
+// ---------------------------------------------------------------------------
+// Pattern 1 matching: DQ -> Reshape -> Transpose -> [Cast] -> MatMul/Gemm
+// ---------------------------------------------------------------------------
 
-  // Collect nodes to remove after iteration (cannot mutate graph during iteration)
-  struct FusionMatch {
-    NodeIndex matmul_idx;
-    std::optional<NodeIndex> cast_idx;
-    NodeIndex transpose_idx;
-    NodeIndex reshape_idx;
-    NodeIndex dq_idx;
-  };
+std::vector<FusionMatch> CollectReshapeTransposeMatches(
+    Graph& graph,
+    const std::vector<NodeIndex>& node_topology_list,
+    const logging::Logger& logger) {
   std::vector<FusionMatch> matches;
 
   for (auto node_index : node_topology_list) {
     auto* node = graph.GetNode(node_index);
     if (!node) continue;
-    ORT_RETURN_IF_ERROR(Recurse(*node, modified, graph_level, logger));
 
-    // Match MatMul or Gemm nodes (MatMulAddFusion may have fused MatMul+Add -> Gemm)
-    if (node->OpType() != "MatMul" && node->OpType() != "Gemm") {
-      continue;
-    }
+    if (node->OpType() != "MatMul" && node->OpType() != "Gemm") continue;
 
-    // Walk backwards from MatMul/Gemm input[1]:
-    // expect [optional Cast] -> Transpose -> Reshape -> DQ
     const auto& mm_inputs = node->InputDefs();
     if (mm_inputs.size() < 2 || !mm_inputs[1] || !mm_inputs[1]->Exists()) continue;
 
@@ -177,21 +203,18 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
     if (!transpose_node || transpose_node->OpType() != "Transpose") continue;
     if (transpose_node->GetOutputEdgesCount() != 1) continue;
 
-    // Find Reshape node producing Transpose input
     const auto& tp_inputs = transpose_node->InputDefs();
     if (tp_inputs.empty() || !tp_inputs[0] || !tp_inputs[0]->Exists()) continue;
     const Node* reshape_node = graph.GetProducerNode(tp_inputs[0]->Name());
     if (!reshape_node || reshape_node->OpType() != "Reshape") continue;
     if (reshape_node->GetOutputEdgesCount() != 1) continue;
 
-    // Find DQ node
     const auto& reshape_inputs = reshape_node->InputDefs();
     if (reshape_inputs.empty() || !reshape_inputs[0] || !reshape_inputs[0]->Exists()) continue;
     const Node* dq_node = graph.GetProducerNode(reshape_inputs[0]->Name());
     if (!dq_node || dq_node->OpType() != "DequantizeLinear") continue;
     if (dq_node->GetOutputEdgesCount() != 1) continue;
 
-    // Validate DQ attributes
     const auto& dq_attrs = dq_node->GetAttributes();
     {
       auto it = dq_attrs.find("axis");
@@ -205,7 +228,6 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
       if (block_size < 16 || ((block_size - 1) & block_size)) continue;
     }
 
-    // Validate DQ weight type and constant initializer.
     const auto* weight_arg = dq_node->InputDefs()[0];
     if (!weight_arg || !weight_arg->Exists()) continue;
     const auto* weight_const_tp = graph.GetConstantInitializer(weight_arg->Name(), true);
@@ -219,7 +241,6 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
     if (bs_dim != block_size) continue;
     const int64_t K = blocks * bs_dim;
 
-    // Validate DQ scale type and constant initializer.
     const auto* scale_arg = dq_node->InputDefs()[1];
     if (!scale_arg || !scale_arg->Exists()) continue;
     const auto* scale_const_tp = graph.GetConstantInitializer(scale_arg->Name(), true);
@@ -228,13 +249,11 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
     if (dt_scale != ONNX_NAMESPACE::TensorProto_DataType_FLOAT &&
         dt_scale != ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) continue;
 
-    // Activation and scales must have the same type for MatMulNBits.
     const auto* a_arg = mm_inputs[0];
     if (!a_arg || !a_arg->TypeAsProto()) continue;
     int32_t dt_a = a_arg->TypeAsProto()->tensor_type().elem_type();
     if (dt_a != dt_scale) continue;
 
-    // Validate Reshape target is exactly [N, K] (allowing ONNX 0/-1 conventions).
     const auto* reshape_shape_arg =
         reshape_node->InputDefs().size() > 1 ? reshape_node->InputDefs()[1] : nullptr;
     if (!reshape_shape_arg || !reshape_shape_arg->Exists()) continue;
@@ -271,14 +290,12 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
       continue;
     }
 
-    // Validate Transpose perm is exactly [1, 0] (or default reverse for rank-2).
     if (const auto* perm_attr = graph_utils::GetNodeAttribute(*transpose_node, "perm")) {
       if (perm_attr->ints_size() != 2 || perm_attr->ints(0) != 1 || perm_attr->ints(1) != 0) {
         continue;
       }
     }
 
-    // Validate MatMul/Gemm K/N contract against the transformed weight shape.
     if (const auto* b_shape = mm_inputs[1]->Shape(); b_shape && b_shape->dim_size() == 2 &&
         utils::HasDimValue(b_shape->dim(0)) && utils::HasDimValue(b_shape->dim(1)) &&
         (b_shape->dim(0).dim_value() != K || b_shape->dim(1).dim_value() != N)) {
@@ -303,44 +320,8 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
       }
     }
 
-    // Validate Gemm attributes and bias shape (if present).
-    // We only support Gemm forms equivalent to MatMul (+ optional 1D bias):
-    //   alpha=1, beta=1, transA=0, transB=0.
-    if (node->OpType() == "Gemm") {
-      if (const auto* alpha_attr = graph_utils::GetNodeAttribute(*node, "alpha");
-          alpha_attr && std::abs(alpha_attr->f() - 1.0f) > 1e-6f) {
-        continue;
-      }
+    if (node->OpType() == "Gemm" && !ValidateGemmForFusion(*node, N)) continue;
 
-      if (const auto* beta_attr = graph_utils::GetNodeAttribute(*node, "beta");
-          beta_attr && std::abs(beta_attr->f() - 1.0f) > 1e-6f) {
-        continue;
-      }
-
-      if (const auto* trans_a_attr = graph_utils::GetNodeAttribute(*node, "transA");
-          trans_a_attr && trans_a_attr->i() != 0) {
-        continue;
-      }
-
-      if (const auto* trans_b_attr = graph_utils::GetNodeAttribute(*node, "transB");
-          trans_b_attr && trans_b_attr->i() != 0) {
-        continue;
-      }
-
-      // If Gemm has bias input C, it must be a 1D bias of shape [N].
-      if (mm_inputs.size() > 2 && mm_inputs[2] && mm_inputs[2]->Exists()) {
-        const auto* bias_shape = mm_inputs[2]->Shape();
-        if (!bias_shape || bias_shape->dim_size() != 1 ||
-            !utils::HasDimValue(bias_shape->dim(0))) {
-          continue;
-        }
-        if (bias_shape->dim(0).dim_value() != N) {
-          continue;
-        }
-      }
-    }
-
-    // Validate optional Cast is type-preserving.
     if (cast_node) {
       const auto* cast_in = cast_node->InputDefs().empty() ? nullptr : cast_node->InputDefs()[0];
       const auto* cast_out = cast_node->OutputDefs().empty() ? nullptr : cast_node->OutputDefs()[0];
@@ -351,7 +332,6 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
       }
     }
 
-    // Validate zero_points constant initializer if present.
     const auto* zp_arg = dq_node->InputDefs().size() > 2 ? dq_node->InputDefs()[2] : nullptr;
     bool has_zp = zp_arg && zp_arg->Exists();
     if (has_zp) {
@@ -368,19 +348,18 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
                        reshape_node->Index(), dq_node->Index()});
   }
 
-  // Collect already-matched MatMul nodes to avoid double-matching
-  std::unordered_set<NodeIndex> matched_matmul_indices;
-  for (const auto& m : matches) {
-    matched_matmul_indices.insert(m.matmul_idx);
-  }
+  return matches;
+}
 
-  // Second pattern: direct DQ(axis=0, 2D UINT4) -> MatMul/Gemm
-  // This covers original QDQ-quantized models (e.g. SDXL _qdq_q4f16.onnx)
-  // where DequantizeLinear feeds directly into MatMul with no Reshape/Transpose.
-  struct DirectDQMatch {
-    NodeIndex matmul_idx;
-    NodeIndex dq_idx;
-  };
+// ---------------------------------------------------------------------------
+// Pattern 2 matching: direct DQ(axis=0, 2D UINT4) -> MatMul/Gemm
+// ---------------------------------------------------------------------------
+
+std::vector<DirectDQMatch> CollectDirectDQMatches(
+    Graph& graph,
+    const std::vector<NodeIndex>& node_topology_list,
+    const std::unordered_set<NodeIndex>& skip_indices,
+    const logging::Logger& logger) {
   std::vector<DirectDQMatch> direct_matches;
 
   for (auto node_index : node_topology_list) {
@@ -388,7 +367,7 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
     if (!node) continue;
 
     if (node->OpType() != "MatMul" && node->OpType() != "Gemm") continue;
-    if (matched_matmul_indices.count(node->Index())) continue;
+    if (skip_indices.count(node->Index())) continue;
 
     const auto& mm_inputs = node->InputDefs();
     if (mm_inputs.size() < 2 || !mm_inputs[1] || !mm_inputs[1]->Exists()) continue;
@@ -443,29 +422,26 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
       if (!HasRank2Shape(*zp_const_tp, k_blocks, N)) continue;
     }
 
-    if (node->OpType() == "Gemm") {
-      if (const auto* alpha_attr = graph_utils::GetNodeAttribute(*node, "alpha");
-          alpha_attr && std::abs(alpha_attr->f() - 1.0f) > 1e-6f) continue;
-      if (const auto* beta_attr = graph_utils::GetNodeAttribute(*node, "beta");
-          beta_attr && std::abs(beta_attr->f() - 1.0f) > 1e-6f) continue;
-      if (const auto* trans_a_attr = graph_utils::GetNodeAttribute(*node, "transA");
-          trans_a_attr && trans_a_attr->i() != 0) continue;
-      if (const auto* trans_b_attr = graph_utils::GetNodeAttribute(*node, "transB");
-          trans_b_attr && trans_b_attr->i() != 0) continue;
-      if (mm_inputs.size() > 2 && mm_inputs[2] && mm_inputs[2]->Exists()) {
-        const auto* bias_shape = mm_inputs[2]->Shape();
-        if (!bias_shape || bias_shape->dim_size() != 1 ||
-            !utils::HasDimValue(bias_shape->dim(0)) ||
-            bias_shape->dim(0).dim_value() != N) continue;
-      }
-    }
+    if (node->OpType() == "Gemm" && !ValidateGemmForFusion(*node, N)) continue;
 
     LOGS(logger, INFO) << "DQMatMulNBitsFusion: matched direct DQ->MatMul pattern at node '"
                        << node->Name() << "' (K=" << K << ", N=" << N << ", block_size=" << block_size << ")";
     direct_matches.push_back({node->Index(), dq_node->Index()});
   }
 
-  // Apply fusions
+  return direct_matches;
+}
+
+// ---------------------------------------------------------------------------
+// Pattern 1 rewriting: DQ+Reshape+Transpose+[Cast]+MatMul/Gemm -> MatMulNBits
+// ---------------------------------------------------------------------------
+
+void ApplyReshapeTransposeFusions(
+    Graph& graph,
+    const std::vector<FusionMatch>& matches,
+    int64_t accuracy_level,
+    bool& modified,
+    const logging::Logger& logger) {
   for (const auto& match : matches) {
     const Node* mm_node = graph.GetNode(match.matmul_idx);
     const Node* cast_node = match.cast_idx ? graph.GetNode(*match.cast_idx) : nullptr;
@@ -485,7 +461,6 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
     const auto& dq_attrs = dq_node->GetAttributes();
     const int64_t block_size = dq_attrs.at("block_size").i();
 
-    // Load source tensors.
     const ONNX_NAMESPACE::TensorProto* weight_tp = nullptr;
     if (!graph.GetInitializedTensor(weight_arg->Name(), weight_tp) || !weight_tp) continue;
     const ONNX_NAMESPACE::TensorProto* scale_tp = nullptr;
@@ -521,7 +496,6 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
 
     auto cpu_allocator = CPUAllocator::DefaultInstance();
 
-    // Allocate destination tensors
     auto weight_dst_name = graph.GenerateNodeArgName(weight_arg->Name() + "_mnb");
     auto weight_dst = Tensor(uint8_type, TensorShape{N, quant_num, blob_bytes}, cpu_allocator);
 
@@ -554,9 +528,6 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
       if (zp_src->data_type() != ONNX_NAMESPACE::TensorProto_DataType_UINT4) continue;
       if (zp_src->size() != static_cast<size_t>(N * quant_num)) continue;
 
-      // WebNN lowering always materializes UINT4 zero_points.
-      // If they are uniformly default 8, emit 3-input MatMulNBits (without
-      // zero_points).
       const bool is_default_uint4_8 =
           IsUniformPackedUint4Value(*zp_src, /*expected_nibble*/ 8);
       if (is_default_uint4_8) {
@@ -574,7 +545,6 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
       memset(zp_dst->MutableDataRaw(), 0, zp_dst->SizeInBytes());
     }
 
-    // Create tensor protos
     auto weight_mnb_tp = utils::TensorToTensorProto(weight_dst, weight_dst_name, true);
     auto scale_mnb_tp = utils::TensorToTensorProto(scale_dst, scale_dst_name, true);
     std::optional<ONNX_NAMESPACE::TensorProto> zp_mnb_tp;
@@ -582,15 +552,13 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
       zp_mnb_tp.emplace(utils::TensorToTensorProto(*zp_dst, zp_dst_name, true));
     }
 
-    // Build MatMulNBits attributes
     NodeAttributes mnb_attrs;
     utils::SetNodeAttribute(utils::MakeAttribute("K", K), mnb_attrs);
     utils::SetNodeAttribute(utils::MakeAttribute("N", N), mnb_attrs);
-    utils::SetNodeAttribute(utils::MakeAttribute("accuracy_level", accuracy_level_), mnb_attrs);
+    utils::SetNodeAttribute(utils::MakeAttribute("accuracy_level", accuracy_level), mnb_attrs);
     utils::SetNodeAttribute(utils::MakeAttribute("bits", static_cast<int64_t>(4)), mnb_attrs);
     utils::SetNodeAttribute(utils::MakeAttribute("block_size", block_size), mnb_attrs);
 
-    // Build inputs: input[0] = activation from MatMul input[0]
     std::vector<NodeArg*> mnb_inputs;
     mnb_inputs.push_back(const_cast<NodeArg*>(mm_node->InputDefs()[0]));
     mnb_inputs.push_back(&graph_utils::AddInitializerWithOrtValue(graph, weight_mnb_tp, std::move(weight_dst)));
@@ -599,9 +567,7 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
       mnb_inputs.push_back(&graph_utils::AddInitializerWithOrtValue(graph, zp_mnb_tp.value(), std::move(*zp_dst)));
     }
 
-    // Preserve Gemm bias (if any) by wiring it to MatMulNBits input[5].
-    // MatMulNBits input layout:
-    //   0:A, 1:B, 2:scales, 3:zero_points(opt), 4:g_idx(opt), 5:bias(opt)
+    // MatMulNBits input layout: 0:A, 1:B, 2:scales, 3:zero_points(opt), 4:g_idx(opt), 5:bias(opt)
     bool fused_with_bias = false;
     if (mm_node->OpType() == "Gemm" &&
         mm_node->InputDefs().size() > 2 &&
@@ -615,11 +581,9 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
       fused_with_bias = true;
     }
 
-    // Build outputs: same as MatMul output
     std::vector<NodeArg*> mnb_outputs;
     mnb_outputs.push_back(const_cast<NodeArg*>(mm_node->OutputDefs()[0]));
 
-    // Add MatMulNBits node
     auto& mnb_node = graph.AddNode(
         graph.GenerateNodeName("WebNNFusedMatMulNBits"),
         "MatMulNBits",
@@ -627,8 +591,6 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
         mnb_inputs, mnb_outputs, &mnb_attrs, kMSDomain);
     mnb_node.SetExecutionProviderType(mm_node->GetExecutionProviderType());
 
-    // Remove old nodes in reverse dependency order
-    // (MatMul/Gemm -> [Cast] -> Transpose -> Reshape -> DQ)
     graph_utils::RemoveNodeOutputEdges(graph, *graph.GetNode(match.matmul_idx));
     graph.RemoveNode(match.matmul_idx);
 
@@ -653,9 +615,19 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
                        << (elide_default_uint4_zp8_input ? " (default UINT4 zp8 elided)" : "");
     modified = true;
   }
+}
 
-  // Apply direct DQ -> MatMul/Gemm fusions
-  for (const auto& match : direct_matches) {
+// ---------------------------------------------------------------------------
+// Pattern 2 rewriting: direct DQ(axis=0) + MatMul/Gemm -> MatMulNBits
+// ---------------------------------------------------------------------------
+
+void ApplyDirectDQFusions(
+    Graph& graph,
+    const std::vector<DirectDQMatch>& matches,
+    int64_t accuracy_level,
+    bool& modified,
+    const logging::Logger& logger) {
+  for (const auto& match : matches) {
     const Node* mm_node = graph.GetNode(match.matmul_idx);
     const Node* dq_node = graph.GetNode(match.dq_idx);
     if (!mm_node || !dq_node) continue;
@@ -706,7 +678,6 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
     TransposePackWeightsAxis0(weight_src.DataAsByteSpan().data(), K, N, block_size,
                               weight_dst.MutableData<uint8_t>());
 
-    // Transpose scales from [k_blocks, N] to [N * k_blocks] (logical [N, k_blocks])
     auto scale_dst_name = graph.GenerateNodeArgName(scale_arg->Name() + "_mnb");
     const int64_t scale_count = N * k_blocks;
     if (scale_src.size() != static_cast<size_t>(scale_count)) continue;
@@ -762,7 +733,7 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
     NodeAttributes mnb_attrs;
     utils::SetNodeAttribute(utils::MakeAttribute("K", K), mnb_attrs);
     utils::SetNodeAttribute(utils::MakeAttribute("N", N), mnb_attrs);
-    utils::SetNodeAttribute(utils::MakeAttribute("accuracy_level", accuracy_level_), mnb_attrs);
+    utils::SetNodeAttribute(utils::MakeAttribute("accuracy_level", accuracy_level), mnb_attrs);
     utils::SetNodeAttribute(utils::MakeAttribute("bits", static_cast<int64_t>(4)), mnb_attrs);
     utils::SetNodeAttribute(utils::MakeAttribute("block_size", block_size), mnb_attrs);
 
@@ -809,6 +780,48 @@ Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
                        << (elide_zp ? " (default UINT4 zp8 elided)" : "");
     modified = true;
   }
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// DQMatMulNBitsFusion public interface
+// ---------------------------------------------------------------------------
+
+DQMatMulNBitsFusion::DQMatMulNBitsFusion(
+    int64_t accuracy_level,
+    concurrency::ThreadPool* intra_op_thread_pool,
+    const InlinedHashSet<std::string_view>& compatible_eps)
+    : GraphTransformer("DQMatMulNBitsFusion", compatible_eps),
+      accuracy_level_(accuracy_level),
+      intra_op_thread_pool_(intra_op_thread_pool) {
+  ORT_ENFORCE(accuracy_level_ >= 0 && accuracy_level_ <= 4,
+              "MatMulNBits accuracy level must be between 0 and 4");
+}
+
+Status DQMatMulNBitsFusion::ApplyImpl(Graph& graph, bool& modified, int graph_level,
+                                      const logging::Logger& logger) const {
+  GraphViewer graph_viewer(graph);
+  const auto& node_topology_list = graph_viewer.GetNodesInTopologicalOrder();
+
+  for (auto node_index : node_topology_list) {
+    auto* node = graph.GetNode(node_index);
+    if (!node) continue;
+    ORT_RETURN_IF_ERROR(Recurse(*node, modified, graph_level, logger));
+  }
+
+  auto matches = CollectReshapeTransposeMatches(graph, node_topology_list, logger);
+
+  std::unordered_set<NodeIndex> matched_matmul_indices;
+  for (const auto& m : matches) {
+    matched_matmul_indices.insert(m.matmul_idx);
+  }
+
+  auto direct_matches = CollectDirectDQMatches(graph, node_topology_list,
+                                               matched_matmul_indices, logger);
+
+  ApplyReshapeTransposeFusions(graph, matches, accuracy_level_, modified, logger);
+  ApplyDirectDQFusions(graph, direct_matches, accuracy_level_, modified, logger);
 
   return Status::OK();
 }

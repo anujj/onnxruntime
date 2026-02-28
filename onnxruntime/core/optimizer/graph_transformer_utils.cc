@@ -285,6 +285,9 @@ InlinedVector<std::unique_ptr<GraphTransformer>> GenerateTransformers(
         transformers.emplace_back(std::make_unique<DQMatMulNBitsFusion>(
             qdq_matmulnbits_accuracy_level, intra_op_thread_pool));
       }
+#else
+      ORT_ENFORCE(!enable_dq_matmulnbits_fusion,
+                  "DQ->MatMulNBits fusion requires contrib ops but DISABLE_CONTRIB_OPS is defined");
 #endif
 
       // run TransposeOptimizer last as it works in a slightly different way by moving Transpose nodes around.
